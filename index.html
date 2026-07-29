@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Invisibility Cloak</title>
+<style>
+  /* Full-bleed dark page, no scrollbars */
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  /* The hidden <video> element only feeds frames to the canvas —
+     we never show it directly, so it stays display:none. */
+  #camera { display: none; }
+
+  /* The canvas is our whole UI. Its internal buffer matches the camera's
+     native resolution; CSS stretches it to fill the window. object-fit:cover
+     crops instead of distorting, just like a phone selfie view. */
+  #stage {
+    width: 100vw;
+    height: 100vh;
+    object-fit: cover;
+    display: block;
+  }
+
+  /* Floating controls, bottom-center */
+  #ui {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    z-index: 10;
+  }
+
+  #status {
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 8px 16px;
+    border-radius: 999px;
+    font-size: 14px;
+    backdrop-filter: blur(6px);
+    white-space: nowrap;
+  }
+
+  #retake {
+    border: none;
+    border-radius: 999px;
+    padding: 12px 22px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #000;
+    background: #fff;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+  #retake:hover  { background: #e8e8e8; }
+  #retake:disabled { opacity: 0.5; cursor: default; }
+
+  /* Big countdown number shown while re-taking the background */
+  #countdown {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-size: 140px;
+    font-weight: 800;
+    color: #fff;
+    text-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+    z-index: 20;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- Hidden camera feed: the source of every frame we draw -->
+<video id="camera" autoplay playsinline muted></video>
+
+<!-- Everything the user sees is composited onto this canvas -->
+<canvas id="stage"></canvas>
+
+<div id="ui">
+  <div id="status">Loading hand tracker…</div>
+  <button id="retake" disabled>📸 Re-take background</button>
+</div>
+
+<div id="countdown"></div>
+
+<script type="module">
+/*
+ * INVISIBILITY CLOAK — how it works
+ * ---------------------------------
+ * 1. Stream the webcam onto a fullscreen canvas, mirrored like a selfie.
+ * 2. MediaPipe HandLandmarker tracks up to 2 hands, 21 landmarks each.
+ * 3. When BOTH hands are visible we take 4 landmarks:
+ *      landmark 4 = thumb tip, landmark 8 = index-finger tip (per hand)
+ *    and connect them into a quadrilateral.
+ * 4. At startup (and on demand) we save one frame of the EMPTY room.
+ *    Each frame we clip the canvas to the quad and paint that saved
+ *    frame inside it — pixel-aligned with the live feed, so whatever
+ *    is inside the quad shows the room "behind" you. Instant hole in
+ *    reality, framed by your fingers.
+ */
+
+// MediaPipe Tasks Vision, loaded straight from Google's CDN as an ES module.
+import { HandLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- DOM handles ----------
+const video       = document.getElementById("camera");
+const canvas      = document.getElementById("stage");
+const ctx         = canvas.getContext("2d");
+const statusEl    = document.getElementById("status");
+const retakeBtn   = document.getElementById("retake");
+const countdownEl = document.getElementById("countdown");
+
+// ---------- App state ----------
+let handLandmarker = null;   // the MediaPipe tracker, once loaded
+let snapshot       = null;   // offscreen canvas holding the empty-room frame
+let snapshotReady  = false;  // true once we've captured a background
+let lastVideoTime  = -1;     // avoids re-running detection on a duplicate frame
+let lastResults    = null;   // most recent detection results (reused between frames)
+
+// =====================================================================
+// STEP 1 — Load the MediaPipe hand tracker
+// =====================================================================
+async function loadHandTracker() {
+  // FilesetResolver fetches the WASM runtime that powers the model.
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      // Pre-trained hand landmark model hosted by Google.
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",            // run on the GPU when available (falls back to CPU)
+    },
+    runningMode: "VIDEO",         // optimized for streaming frames, uses temporal tracking
+    numHands: 2,                  // we need both hands for the four corners
+  });
+}
+
+// =====================================================================
+// STEP 2 — Start the webcam
+// =====================================================================
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: "user",                 // front camera on laptops/phones
+      width:  { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+    audio: false,
+  });
+  video.srcObject = stream;
+
+  // Wait until the video reports its real dimensions before sizing the canvas.
+  await new Promise((resolve) => (video.onloadedmetadata = resolve));
+  await video.play();
+
+  // Canvas buffer = camera's native resolution. CSS handles the fullscreen fit.
+  canvas.width  = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  // Offscreen canvas for the background snapshot, same size as the feed.
+  snapshot = document.createElement("canvas");
+  snapshot.width  = canvas.width;
+  snapshot.height = canvas.height;
+}
+
+// =====================================================================
+// STEP 3 — Background snapshot ("the empty room")
+// =====================================================================
+// Copies the current camera frame into the offscreen snapshot canvas.
+// We store the RAW (un-mirrored) frame; the render loop mirrors the live
+// feed and the snapshot with the SAME transform, so they always align
+// pixel-for-pixel.
+function captureBackground() {
+  snapshot.getContext("2d").drawImage(video, 0, 0);
+  snapshotReady = true;
+}
+
+// Re-take with a 3-second countdown, so you have time to step out of frame —
+// otherwise your arm (reaching for the button) becomes part of the "empty" room.
+function retakeBackground() {
+  retakeBtn.disabled = true;
+  let n = 3;
+  countdownEl.style.display = "flex";
+  countdownEl.textContent = n;
+
+  const tick = setInterval(() => {
+    n--;
+    if (n > 0) {
+      countdownEl.textContent = n;
+    } else {
+      clearInterval(tick);
+      countdownEl.style.display = "none";
+      captureBackground();
+      retakeBtn.disabled = false;
+    }
+  }, 1000);
+}
+retakeBtn.addEventListener("click", retakeBackground);
+
+// =====================================================================
+// STEP 4 — Geometry helper: order 4 points into a clean quad
+// =====================================================================
+// The four fingertips arrive in arbitrary order. Connecting them naively
+// can produce a self-intersecting "bowtie". Sorting them by angle around
+// their centroid guarantees a proper convex walk around the shape.
+function sortIntoPolygon(points) {
+  const cx = points.reduce((s, p) => s + p.x, 0) / points.length;
+  const cy = points.reduce((s, p) => s + p.y, 0) / points.length;
+  return points
+    .slice()
+    .sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+}
+
+// =====================================================================
+// STEP 5 — The render loop (runs every display frame)
+// =====================================================================
+function render() {
+  // --- Mirror everything ---------------------------------------------
+  // setTransform(-1,0,0,1,width,0) flips the x-axis: x=0 becomes the right
+  // edge. Every drawImage after this is mirrored, which makes the feed feel
+  // like a mirror. Landmarks are in the video's coordinate space, so they
+  // get flipped by the same transform and stay glued to your fingers.
+  ctx.setTransform(-1, 0, 0, 1, canvas.width, 0);
+
+  // Draw the live camera frame (the base layer).
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // --- Detect hands (only when there's a NEW video frame) -------------
+  if (handLandmarker && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    lastResults = handLandmarker.detectForVideo(video, performance.now());
+  }
+
+  const hands = lastResults ? lastResults.landmarks : [];
+
+  // --- The cloak: needs both hands AND a saved background -------------
+  if (hands.length === 2 && snapshotReady) {
+    // Landmark indices: 4 = thumb tip, 8 = index-finger tip.
+    // Landmarks are normalized (0..1), so scale up to canvas pixels.
+    const corners = [];
+    for (const hand of hands) {
+      corners.push({ x: hand[4].x * canvas.width, y: hand[4].y * canvas.height });
+      corners.push({ x: hand[8].x * canvas.width, y: hand[8].y * canvas.height });
+    }
+
+    const quad = sortIntoPolygon(corners);
+
+    // Clip to the quad, then paint the snapshot at (0,0) — the exact same
+    // position and transform as the live feed. Only the pixels inside the
+    // quad change, and they show the empty room instead of you.
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(quad[0].x, quad[0].y);
+    for (let i = 1; i < quad.length; i++) ctx.lineTo(quad[i].x, quad[i].y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(snapshot, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    statusEl.textContent = "🪄 Cloak active — you're invisible in the frame";
+  } else if (!snapshotReady) {
+    statusEl.textContent = "Waiting for background snapshot…";
+  } else if (hands.length === 1) {
+    statusEl.textContent = "One hand found — show the other one";
+  } else {
+    statusEl.textContent = "Show both hands to frame the cloak";
+  }
+
+  requestAnimationFrame(render);
+}
+
+// =====================================================================
+// Boot sequence
+// =====================================================================
+async function main() {
+  try {
+    statusEl.textContent = "Loading hand tracker…";
+    await loadHandTracker();
+
+    statusEl.textContent = "Requesting camera…";
+    await startCamera();
+
+    // Initial "empty room" snapshot the moment the stream starts.
+    // (If you were in frame, hit Re-take and step aside during the countdown.)
+    captureBackground();
+    retakeBtn.disabled = false;
+
+    render();
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+    console.error(err);
+  }
+}
+
+main();
+</script>
+</body>
+</html>
